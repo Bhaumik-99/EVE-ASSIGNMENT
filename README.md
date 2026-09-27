@@ -40,11 +40,11 @@ A production-grade FastAPI backend for diagnostic centre discovery, authenticate
 - **Role-Based Access Control (RBAC)**: Public patient self-registration; patients manage only their own bookings; `ADMIN` role can view and cancel any booking and manages the entire catalogue.
 - **Double-Booking Prevention**: Database-level composite unique constraint `(centre_id, test_id, appointment_at)` coupled with atomic transaction isolation.
 - **Stripe-Style Payment Idempotency**: Support for client `Idempotency-Key` headers paired with canonical request SHA-256 digests.
-- **Webhook Ledger & Replay Safety**: Dedicated `payment_events` immutable ledger table with unique provider `event_id` and HMAC-SHA256 request signature verification.
+- **Webhook Audit Event History & Replay Safety**: Dedicated `payment_events` table with unique provider `event_id` and HMAC-SHA256 request signature verification. Note: events are scoped to their parent payment lifecycle (CASCADE delete with payment).
 - **Terminal State Protection**: Explicit state guards preventing regressions (e.g. `CONFIRMED` cannot regress to `FAILED`, and `CANCELLED` bookings cannot be resurrected).
 - **Redis Caching**: High-performance caching layer on diagnostic centre and test queries with automated TTL invalidation on administrative mutations.
 - **Celery & Background Jobs**: Asynchronous background workers powered by Celery & Redis for patient booking confirmation notifications and resilient webhook retries.
-- **Webhook Retry Handling**: Resilient retry pipeline (`POST /api/v1/payments/webhook/retry`) executing with exponential backoff on transient failures.
+- **Webhook Retry Handling**: A dedicated `POST /api/v1/payments/webhook/retry` endpoint accepts a pre-validated webhook payload and queues it as a Celery task with exponential backoff retries. The normal `POST /api/v1/payments/webhook` endpoint processes synchronously; automatic retry-on-failure of that path would require a durable queue (see improvements section).
 - **Observability & Resilience**: Structured JSON logging, `X-Request-ID` correlation tracking, in-memory rate limiting with `Retry-After` headers, and Kubernetes `/health` & `/ready` probes.
 
 ---
@@ -205,7 +205,7 @@ graph TB
    ```bash
    pytest
    ```
-   *Runs 40 test scenarios against isolated in-memory storage covering auth, catalog, booking, idempotency, caching, background tasks, and webhooks.*
+   *Runs 41 test scenarios against isolated in-memory storage covering auth, catalog, booking, idempotency, caching, background tasks, and webhooks.*
 
 2. **Run PostgreSQL Concurrency & Race-Condition Tests**:
    Ensure a local PostgreSQL instance is running, then execute:
@@ -408,7 +408,7 @@ graph TB
   }
   ```
   *(Note: `force_status` is optional; if omitted, the mock gateway non-deterministically returns `SUCCESS` or `FAILED`).*
-- **Response (`200 OK`)**:
+- **Response (`201 Created`)**:
   ```json
   {
     "id": "p9a8b7c6-d5e4-3f21-0a9b-8c7d6e5f4a3b",
@@ -419,6 +419,7 @@ graph TB
     "created_at": "2026-09-27T10:20:00Z"
   }
   ```
+  > **Idempotent replay**: Subsequent calls with the same `Idempotency-Key` and identical payload also return `201 Created` with the original payment object.
 
 ---
 
@@ -568,7 +569,7 @@ erDiagram
 | | `idempotency_key` | String(128) | Unique nullable client idempotency key |
 | | `idempotency_request_hash` | String(64) | SHA-256 hash of payload; detects key reuse with mismatched body |
 | **payment_events** | `id` | UUID (String 36) | Primary Key |
-| | `event_id` | String(128) | **Unique constraint**: True idempotency ledger for webhooks |
+| | `event_id` | String(128) | **Unique constraint**: Idempotency/audit event log for webhooks; scoped to payment lifecycle |
 | | `received_at` | DateTime(timezone=True) | Audit log timestamp of webhook arrival |
 
 ---
@@ -611,6 +612,7 @@ stateDiagram-v2
     B_FAILED --> B_FAILED : Duplicate FAILED Webhook (Idempotent 200 OK)
 
     note right of B_CONFIRMED : Terminal against contradictory webhooks.<br/>Cannot transition to FAILED (409 Conflict).
+    note right of B_FAILED : Terminal state.<br/>No further payment attempts allowed (409 Conflict).
     note right of B_CANCELLED : Terminal state.<br/>Cannot be resurrected by any webhook (409 Conflict).
 ```
 
@@ -640,7 +642,7 @@ sequenceDiagram
         PS->>DB: Insert Payment (status=SUCCESS/FAILED)
         PS->>DB: Update Booking status (CONFIRMED/FAILED)
         PS->>DB: Commit Transaction
-        API-->>Patient: 200 OK (Payment Processed)
+        API-->>Patient: 201 Created (Payment Processed)
     end
     end
 
@@ -686,7 +688,7 @@ sequenceDiagram
 3. **Single Test per Booking**:
    - In accordance with the assignment scope, a booking maps to exactly one test at a diagnostic centre. Multi-item cart checkout can build on top of this model by grouping bookings under an order aggregate.
 4. **Single Payment Record per Booking**:
-   - The simplified billing lifecycle models one primary payment attempt per booking. If a payment succeeds, the booking transitions to `CONFIRMED`. If it fails, the booking marks as `FAILED` and allows a retry or remains terminal.
+   - The simplified billing lifecycle models one primary payment attempt per booking. If a payment succeeds, the booking transitions to `CONFIRMED` (terminal). If it fails, the booking transitions to `FAILED` (also terminal — no further payment attempts are accepted).
 5. **Deterministic Testing vs Production Simulation**:
    - The mock payment endpoint provides a `force_status` parameter (`SUCCESS` or `FAILED`) solely for reproducible, deterministic test runs and demos. When omitted, it simulates realistic provider randomness.
 6. **Webhook Signature Security Model**:

@@ -107,7 +107,14 @@ def update_centre(
         not_found("Diagnostic centre not found")
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(centre, field, value)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A centre with this name already exists at this location",
+        ) from exc
     db.refresh(centre)
     cache.delete_pattern("centres:*")
     cache.delete(f"centre:{centre_id}")

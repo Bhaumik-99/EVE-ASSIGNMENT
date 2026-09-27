@@ -34,6 +34,7 @@ def upgrade() -> None:
         sa.Column("location", sa.String(length=255), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("name", "location", name="uq_centre_name_location"),
     )
     op.create_index("ix_diagnostic_centres_name", "diagnostic_centres", ["name"], unique=False)
 
@@ -120,6 +121,7 @@ def downgrade() -> None:
     op.drop_table("payments")
     op.drop_table("bookings")
     op.drop_table("diagnostic_tests")
+    # uq_centre_name_location is dropped implicitly when the table is dropped
     op.drop_table("diagnostic_centres")
     op.drop_table("users")
     bind = op.get_bind()

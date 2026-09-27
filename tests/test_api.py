@@ -461,6 +461,20 @@ def test_duplicate_centre_is_rejected(client):
     assert client.post("/api/v1/centres", headers=admin, json=payload).status_code == 409
 
 
+def test_update_centre_duplicate_is_rejected(client):
+    admin = admin_auth(client)
+    c1 = client.post("/api/v1/centres", headers=admin, json={"name": "Centre Delhi", "location": "Delhi"}).json()
+    c2 = client.post("/api/v1/centres", headers=admin, json={"name": "Centre Mumbai", "location": "Mumbai"}).json()
+    # Try updating c2 to have the same (name, location) as c1
+    r = client.patch(
+        f"/api/v1/centres/{c2['id']}",
+        headers=admin,
+        json={"name": "Centre Delhi", "location": "Delhi"},
+    )
+    assert r.status_code == 409
+    assert "already exists at this location" in r.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # Public endpoint access tests
 # ---------------------------------------------------------------------------

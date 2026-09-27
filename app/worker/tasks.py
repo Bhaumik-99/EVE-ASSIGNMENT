@@ -75,34 +75,16 @@ def process_webhook_retry(
             raise
 
 
-def _is_broker_available() -> bool:
-    """
-    Probe whether the Celery broker is reachable.
-    Uses a very short timeout so it fails fast when Redis is offline.
-    Deliberately independent of cache availability.
-    """
-    try:
-        insp = celery_app.control.inspect(timeout=0.2)
-        # ping() returns None or an empty dict when no workers reply, but the
-        # *connection* itself tells us whether the broker is reachable.
-        insp.ping()
-        return True
-    except Exception:
-        return False
-
-
 def dispatch_task(task_func, *args, **kwargs):
     """
-    Dispatches a task via Celery worker if the broker is reachable.
-    Falls back instantly to synchronous execution if the broker is offline.
-
-    Note: broker availability is probed independently of Redis cache
-    availability so that a cache outage does not disable background tasks.
+    Dispatches a task asynchronously via Celery worker.
+    Falls back immediately to synchronous execution if the broker is unavailable.
     """
     try:
         return task_func.delay(*args, **kwargs)
     except Exception as exc:
         logger.info("Celery broker unavailable (%s); executing task synchronously", exc)
         return task_func(*args, **kwargs)
+
 
 

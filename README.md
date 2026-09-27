@@ -109,12 +109,17 @@ graph TB
     PAY -.->|"Verify Signature"| HMAC
 
     AUTH --> U
-    CTR --> DC & DT
+    CTR --> DC
+    CTR --> DT
     BKG --> BS
     PAY --> PS
 
-    BS --> BK & DT & DC
-    PS --> PM & PE & BK
+    BS --> BK
+    BS --> DT
+    BS --> DC
+    PS --> PM
+    PS --> PE
+    PS --> BK
 ```
 
 ---
@@ -646,10 +651,11 @@ sequenceDiagram
         API->>PS: process_webhook(payload)
         PS->>DB: Query payment_events for event_id
         alt Duplicate event_id with identical payload
-            PS-->>API: 200 OK (Idempotent replay detected; no-op)
-        else Duplicate event_id with mismatched payload
+            PS-->>API: 200 OK (Idempotent replay - no duplicate processing)
+        else Duplicate event_id with altered payload
             PS-->>API: 409 Conflict (Payload tamper detected)
-        else Fresh event_id
+        end
+        opt Fresh event_id
             PS->>DB: Append to payment_events audit ledger
             PS->>DB: Lock and inspect Booking & Payment
             alt Booking is Terminal (CANCELLED or already CONFIRMED)

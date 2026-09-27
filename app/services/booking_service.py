@@ -3,7 +3,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 
-from app.models import Booking, BookingStatus, DiagnosticTest, User
+from app.models import Booking, BookingStatus, DiagnosticTest, User, UserRole
 
 
 def create_booking(db: Session, *, payload, current_user: User) -> Booking:
@@ -34,7 +34,8 @@ def cancel_booking(db: Session, *, booking_id: str, current_user: User) -> Booki
     booking = db.scalar(select(Booking).where(Booking.id == booking_id).with_for_update())
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
-    if booking.user_id != current_user.id:
+    # Admins may cancel any booking; patients may only cancel their own.
+    if current_user.role != UserRole.ADMIN and booking.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="You cannot modify this booking")
     if booking.status not in {BookingStatus.PENDING, BookingStatus.CONFIRMED}:
         raise HTTPException(status_code=409, detail=f"Cannot cancel a {booking.status.value} booking")

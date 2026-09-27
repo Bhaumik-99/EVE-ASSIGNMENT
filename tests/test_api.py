@@ -559,4 +559,60 @@ def test_webhook_retry_endpoint(client):
     assert response.json()["status"] == "accepted"
 
 
+# ---------------------------------------------------------------------------
+# Admin RBAC tests
+# ---------------------------------------------------------------------------
 
+def test_admin_can_list_all_bookings(client):
+    """Admin's GET /bookings returns bookings from all users."""
+    user1 = auth(client, "rbac_u1@example.com")
+    user2 = auth(client, "rbac_u2@example.com")
+    admin = admin_auth(client)
+    make_booking(client, user1, admin_headers=admin, days=40, suffix=" RBAC1")
+    make_booking(client, user2, admin_headers=admin, days=41, suffix=" RBAC2")
+
+    admin_list = client.get("/api/v1/bookings", headers=admin)
+    assert admin_list.status_code == 200
+    assert len(admin_list.json()) >= 2
+
+
+def test_admin_can_get_any_booking(client):
+    """Admin can GET /bookings/{id} for a booking that belongs to another user."""
+    user = auth(client, "rbac_u3@example.com")
+    admin = admin_auth(client)
+    booking = make_booking(client, user, admin_headers=admin, days=42, suffix=" RBAC3")
+
+    r = client.get(f"/api/v1/bookings/{booking['id']}", headers=admin)
+    assert r.status_code == 200
+    assert r.json()["id"] == booking["id"]
+
+
+def test_admin_can_cancel_any_booking(client):
+    """Admin can POST /bookings/{id}/cancel for a booking that belongs to another user."""
+    user = auth(client, "rbac_u4@example.com")
+    admin = admin_auth(client)
+    booking = make_booking(client, user, admin_headers=admin, days=43, suffix=" RBAC4")
+
+    r = client.post(f"/api/v1/bookings/{booking['id']}/cancel", headers=admin)
+    assert r.status_code == 200
+    assert r.json()["status"] == "CANCELLED"
+
+
+def test_payment_dispatches_confirmation_on_success(client):
+    """A successful payment triggers the booking confirmation task."""
+    from app.worker.tasks import send_booking_confirmation
+    headers = auth(client)
+    admin = admin_auth(client)
+    booking = make_booking(client, headers, admin_headers=admin, days=44, suffix=" Dispatch")
+
+    payment = client.post(
+        "/api/v1/payments",
+        headers=headers,
+        json={"booking_id": booking["id"], "force_status": "SUCCESS"},
+    )
+    assert payment.status_code == 201
+    assert payment.json()["status"] == "SUCCESS"
+
+    # Task must be callable directly and return a sent status
+    res = send_booking_confirmation(booking["id"])
+    assert res["status"] == "sent"

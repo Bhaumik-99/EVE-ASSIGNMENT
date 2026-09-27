@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from starlette.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -14,8 +13,8 @@ from sqlalchemy.orm import Session, selectinload
 from app.api.deps import get_current_user, require_admin
 from app.core.config import settings
 from app.core.security import create_access_token, hash_password, verify_password
-from app.db.session import get_db
-from app.models import Booking, DiagnosticCentre, DiagnosticTest, PaymentStatus, User
+from app.db.session import get_db, SessionLocal
+from app.models import Booking, DiagnosticCentre, DiagnosticTest, PaymentStatus, User, UserRole
 from app.schemas import (
     BookingCreate,
     BookingOut,
@@ -237,27 +236,27 @@ def list_my_bookings(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return db.scalars(
-        select(Booking)
-        .where(Booking.user_id == current_user.id)
-        .order_by(Booking.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-    ).all()
+    """List bookings. Admins see all bookings; patients see only their own."""
+    stmt = select(Booking).order_by(Booking.created_at.desc()).offset(skip).limit(limit)
+    if current_user.role.value != "ADMIN":
+        stmt = stmt.where(Booking.user_id == current_user.id)
+    return db.scalars(stmt).all()
 
 
 @router.get("/bookings/{booking_id}", response_model=BookingOut)
 def get_booking(booking_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Retrieve a booking by ID. Admins can access any booking; patients only their own."""
     booking = db.get(Booking, booking_id)
     if not booking:
         not_found("Booking not found")
-    if booking.user_id != current_user.id:
+    if current_user.role != UserRole.ADMIN and booking.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="You cannot access this booking")
     return booking
 
 
 @router.post("/bookings/{booking_id}/cancel", response_model=BookingOut)
 def cancel_booking(booking_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Cancel a booking. Admins can cancel any booking; patients can only cancel their own."""
     return cancel_booking_service(db, booking_id=booking_id, current_user=current_user)
 
 
@@ -284,7 +283,7 @@ def process_payment(
             separators=(",", ":"),
         ).encode("utf-8")
         request_hash = hashlib.sha256(canonical).hexdigest()
-    return process_mock_payment(
+    payment = process_mock_payment(
         db,
         booking_id=payload.booking_id,
         user_id=current_user.id,
@@ -300,10 +299,10 @@ def process_payment(
 @router.post("/payments/webhook", response_model=PaymentOut)
 async def payment_webhook(
     request: Request,
-    db: Session = Depends(get_db),
 ):
-    # Await the body first (requires async context), then dispatch DB work
-    # to the thread-pool so the sync SQLAlchemy calls don't block the event loop.
+    # Each webhook call opens its own DB session so it is safe to call
+    # process_webhook (a synchronous function) directly without run_in_threadpool.
+    # Sharing the request-scoped `db` dependency across threads is not safe.
     raw_body = await request.body()
     verify_webhook_signature(raw_body, request.headers.get("X-Webhook-Signature"))
     try:
@@ -311,18 +310,20 @@ async def payment_webhook(
         payload = PaymentWebhook.model_validate(payload_data)
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="Invalid webhook payload") from exc
-    payment = await run_in_threadpool(
-        process_webhook,
-        db,
-        event_id=payload.event_id,
-        payment_id=payload.payment_id,
-        booking_id=payload.booking_id,
-        status=payload.status,
-        amount=payload.amount,
-    )
-    if payment.status == PaymentStatus.SUCCESS:
+    with SessionLocal() as db:
+        payment = process_webhook(
+            db,
+            event_id=payload.event_id,
+            payment_id=payload.payment_id,
+            booking_id=payload.booking_id,
+            status=payload.status,
+            amount=payload.amount,
+        )
+        # Eagerly load the payment data before the session closes
+        payment_out = PaymentOut.model_validate(payment)
+    if payment_out.status == PaymentStatus.SUCCESS:
         dispatch_task(send_booking_confirmation, str(payload.booking_id))
-    return payment
+    return payment_out
 
 
 @router.post("/payments/webhook/retry", status_code=status.HTTP_202_ACCEPTED)

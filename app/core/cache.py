@@ -49,7 +49,7 @@ class CacheClient:
         serialized = json.dumps(value, default=str)
         if self._is_redis_available and self._redis:
             try:
-                self._redis.setex(key, ttl, serialized)
+                self._redis.set(key, serialized, ex=ttl)
                 return
             except Exception as exc:
                 logger.warning("Redis SET failed for %s: %s", key, exc)

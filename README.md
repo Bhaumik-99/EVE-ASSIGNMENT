@@ -37,7 +37,7 @@ A production-grade FastAPI backend for diagnostic centre discovery, authenticate
 - **FastAPI & Pydantic V2**: Clean route layering, strong typing, and auto-generated Swagger UI / OpenAPI schemas.
 - **PostgreSQL & SQLAlchemy 2**: Fully declarative typed models (`Mapped[...]`), connection pooling with `pool_pre_ping=True`, and managed migrations via Alembic.
 - **Enterprise Security**: Argon2id password hashing via `pwdlib`, asymmetric/HS256 JWT tokens, and strict production startup secrets validation.
-- **Role-Based Access Control (RBAC)**: Public patient registration, authenticated patient self-service, and protected `ADMIN` catalogue management.
+- **Role-Based Access Control (RBAC)**: Public patient self-registration; patients manage only their own bookings; `ADMIN` role can view and cancel any booking and manages the entire catalogue.
 - **Double-Booking Prevention**: Database-level composite unique constraint `(centre_id, test_id, appointment_at)` coupled with atomic transaction isolation.
 - **Stripe-Style Payment Idempotency**: Support for client `Idempotency-Key` headers paired with canonical request SHA-256 digests.
 - **Webhook Ledger & Replay Safety**: Dedicated `payment_events` immutable ledger table with unique provider `event_id` and HMAC-SHA256 request signature verification.
@@ -205,7 +205,7 @@ graph TB
    ```bash
    pytest
    ```
-   *Runs 32 test scenarios against isolated in-memory storage covering auth, catalog, booking, idempotency, and webhooks.*
+   *Runs 40 test scenarios against isolated in-memory storage covering auth, catalog, booking, idempotency, caching, background tasks, and webhooks.*
 
 2. **Run PostgreSQL Concurrency & Race-Condition Tests**:
    Ensure a local PostgreSQL instance is running, then execute:
@@ -375,13 +375,13 @@ graph TB
   }
   ```
 
-#### List User's Bookings (Paginated)
+#### List Bookings (Paginated)
 - **Endpoint**: `GET /api/v1/bookings?skip=0&limit=20`
-- **Access**: Authenticated (`PATIENT` sees only their own; `ADMIN` sees all)
+- **Access**: Authenticated — `PATIENT` sees only their own; `ADMIN` sees all users' bookings
 
 #### Cancel a Booking
 - **Endpoint**: `POST /api/v1/bookings/{booking_id}/cancel`
-- **Access**: Authenticated owner or `ADMIN`
+- **Access**: Authenticated booking owner **or** `ADMIN` (admins may cancel any booking)
 - **Response (`200 OK`)**:
   ```json
   {
@@ -725,20 +725,19 @@ sequenceDiagram
 
 ## What You Would Improve If You Had More Time
 
-1. **Distributed Caching & Redis Integration**:
-   - Replace the in-memory token bucket rate limiter with a Redis-backed sliding window limiter (`fastapi-limiter`) so multiple Uvicorn worker replicas share exact quota counters.
-   - Store idempotency keys and cached centre listings in Redis with TTLs for sub-millisecond retrieval.
-2. **Asynchronous Background Task Queue (Celery / ARQ / RabbitMQ)**:
-   - Move non-critical webhook side effects (sending email confirmation, SMS appointment reminders, generating PDF invoices) into an asynchronous task queue.
-3. **Calendar Capacity & Slot Inventory Engine**:
-   - Transition from arbitrary timestamps to an explicit slot inventory system (e.g., 30-minute intervals, operating hours 08:00–20:00, holiday blackouts, and max concurrent appointment capacity per doctor/machine).
-4. **Production Payment Gateway Integrations**:
+1. **Distributed Rate Limiting**:
+   - The current per-process in-memory rate limiter works for single-instance deployments. For multi-replica production setups it should be replaced with a Redis-backed sliding window counter (`fastapi-limiter`) so all Uvicorn workers share quota state.
+2. **Calendar Capacity & Slot Inventory Engine**:
+   - Transition from arbitrary timestamps to an explicit slot inventory system (e.g., 30-minute intervals, operating hours 08:00–20:00, holiday blackouts, and max concurrent appointment capacity per machine).
+3. **Production Payment Gateway Integrations**:
    - Integrate official SDKs for Stripe and Razorpay, including automatic webhook event verification, refund lifecycles, and partial payment handling.
-5. **Enhanced Authentication & Security**:
-   - Implement refresh token rotation, token revocation blocklists, Multi-Factor Authentication (MFA), and email verification links.
-6. **Observability, Tracing & Metrics**:
+4. **Enhanced Authentication & Security**:
+   - Implement refresh token rotation, token revocation blocklists, Multi-Factor Authentication (MFA), and email verification flows.
+5. **Observability, Tracing & Metrics**:
    - Export Prometheus metrics (`/metrics`) tracking request latency percentiles (p50, p95, p99), error rates, and active DB pool connections.
-   - Integrate OpenTelemetry for distributed end-to-end request tracing into Jaeger or Grafana Tempo.
-7. **CI/CD & Container Hardening**:
+   - Integrate OpenTelemetry distributed tracing into Jaeger or Grafana Tempo for end-to-end request visibility.
+6. **CI/CD & Container Hardening**:
    - Run production Docker containers as a non-root unprivileged user (`USER 1000:1000`).
-   - Add automated container vulnerability scanning (Trivy) and static application security testing (Bandit/Semgrep) to GitHub Actions.
+   - Add automated container vulnerability scanning (Trivy) and static security analysis (Bandit/Semgrep) to GitHub Actions.
+7. **Admin User Management API**:
+   - Expose a protected `POST /api/v1/users/{user_id}/promote` endpoint so admins can elevate existing patients to the `ADMIN` role via API rather than requiring direct DB access.

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q app tests
+      - run: pytest -q -m "not integration"
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: diagnostic_booking
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d diagnostic_booking"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/diagnostic_booking
+          JWT_SECRET_KEY: ci-jwt-secret
+          WEBHOOK_SECRET: ci-webhook-secret
+        run: alembic upgrade head
+      - name: Run PostgreSQL integration tests
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/diagnostic_booking
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/diagnostic_booking
+          JWT_SECRET_KEY: ci-jwt-secret
+          WEBHOOK_SECRET: ci-webhook-secret
+        run: pytest -q -m integration

@@ -1,0 +1,290 @@
+import hashlib
+import hmac
+import json
+import secrets
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from starlette.concurrency import run_in_threadpool
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, selectinload
+
+from app.api.deps import get_current_user, require_admin
+from app.core.config import settings
+from app.core.security import create_access_token, hash_password, verify_password
+from app.db.session import get_db
+from app.models import Booking, DiagnosticCentre, DiagnosticTest, PaymentStatus, User
+from app.schemas import (
+    BookingCreate,
+    BookingOut,
+    CentreCreate,
+    CentreOut,
+    CentreUpdate,
+    LoginRequest,
+    PaymentOut,
+    PaymentRequest,
+    PaymentWebhook,
+    TestCreate,
+    TestOut,
+    TestUpdate,
+    TokenOut,
+    UserCreate,
+    UserOut,
+)
+from app.services.booking_service import cancel_booking as cancel_booking_service
+from app.services.booking_service import create_booking as create_booking_service
+from app.services.payment_service import process_mock_payment, process_webhook
+
+router = APIRouter()
+
+
+def not_found(detail: str):
+    raise HTTPException(status_code=404, detail=detail)
+
+
+def verify_webhook_signature(raw_body: bytes, provided_signature: str | None) -> None:
+    if not provided_signature:
+        raise HTTPException(status_code=401, detail="Webhook signature required")
+    expected = hmac.new(settings.webhook_secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, provided_signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+
+@router.post("/auth/signup", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def signup(payload: UserCreate, db: Session = Depends(get_db)):
+    email = payload.email.lower()
+    if db.scalar(select(User).where(User.email == email)):
+        raise HTTPException(status_code=409, detail="Email already registered")
+    user = User(email=email, password_hash=hash_password(payload.password), full_name=payload.full_name)
+    db.add(user)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Email already registered") from exc
+    db.refresh(user)
+    return user
+
+
+@router.post("/auth/login", response_model=TokenOut)
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.email == payload.email.lower()))
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return TokenOut(access_token=create_access_token(user.id))
+
+
+@router.post("/centres", response_model=CentreOut, status_code=status.HTTP_201_CREATED)
+def create_centre(payload: CentreCreate, _: User = Depends(require_admin), db: Session = Depends(get_db)):
+    centre = DiagnosticCentre(name=payload.name, location=payload.location)
+    db.add(centre)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A centre with this name already exists at this location") from exc
+    db.refresh(centre)
+    return centre
+
+
+@router.patch("/centres/{centre_id}", response_model=CentreOut)
+def update_centre(
+    centre_id: str,
+    payload: CentreUpdate,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    centre = db.scalar(
+        select(DiagnosticCentre)
+        .options(selectinload(DiagnosticCentre.tests))
+        .where(DiagnosticCentre.id == centre_id)
+    )
+    if not centre:
+        not_found("Diagnostic centre not found")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(centre, field, value)
+    db.commit()
+    db.refresh(centre)
+    return centre
+
+
+@router.get("/centres", response_model=list[CentreOut])
+def list_centres(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    return db.scalars(
+        select(DiagnosticCentre)
+        .options(selectinload(DiagnosticCentre.tests))
+        .order_by(DiagnosticCentre.name)
+        .offset(skip)
+        .limit(limit)
+    ).all()
+
+
+@router.get("/centres/{centre_id}", response_model=CentreOut)
+def get_centre(centre_id: str, db: Session = Depends(get_db)):
+    centre = db.scalar(
+        select(DiagnosticCentre)
+        .options(selectinload(DiagnosticCentre.tests))
+        .where(DiagnosticCentre.id == centre_id)
+    )
+    if not centre:
+        not_found("Diagnostic centre not found")
+    return centre
+
+
+@router.post("/centres/{centre_id}/tests", response_model=TestOut, status_code=status.HTTP_201_CREATED)
+def create_test(
+    centre_id: str,
+    payload: TestCreate,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    if not db.get(DiagnosticCentre, centre_id):
+        not_found("Diagnostic centre not found")
+    test = DiagnosticTest(
+        centre_id=centre_id,
+        name=payload.name,
+        description=payload.description,
+        price=payload.price,
+    )
+    db.add(test)
+    db.commit()
+    db.refresh(test)
+    return test
+
+
+@router.patch("/centres/{centre_id}/tests/{test_id}", response_model=TestOut)
+def update_test(
+    centre_id: str,
+    test_id: str,
+    payload: TestUpdate,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    test = db.scalar(
+        select(DiagnosticTest).where(
+            DiagnosticTest.id == test_id,
+            DiagnosticTest.centre_id == centre_id,
+        )
+    )
+    if not test:
+        not_found("Diagnostic test not found")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(test, field, value)
+    db.commit()
+    db.refresh(test)
+    return test
+
+
+@router.get("/centres/{centre_id}/tests", response_model=list[TestOut])
+def list_tests(centre_id: str, db: Session = Depends(get_db)):
+    if not db.get(DiagnosticCentre, centre_id):
+        not_found("Diagnostic centre not found")
+    return db.scalars(
+        select(DiagnosticTest)
+        .where(DiagnosticTest.centre_id == centre_id)
+        .order_by(DiagnosticTest.name)
+    ).all()
+
+
+@router.post("/bookings", response_model=BookingOut, status_code=status.HTTP_201_CREATED)
+def create_booking(
+    payload: BookingCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return create_booking_service(db, payload=payload, current_user=current_user)
+
+
+@router.get("/bookings", response_model=list[BookingOut])
+def list_my_bookings(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return db.scalars(
+        select(Booking)
+        .where(Booking.user_id == current_user.id)
+        .order_by(Booking.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    ).all()
+
+
+@router.get("/bookings/{booking_id}", response_model=BookingOut)
+def get_booking(booking_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    booking = db.get(Booking, booking_id)
+    if not booking:
+        not_found("Booking not found")
+    if booking.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You cannot access this booking")
+    return booking
+
+
+@router.post("/bookings/{booking_id}/cancel", response_model=BookingOut)
+def cancel_booking(booking_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return cancel_booking_service(db, booking_id=booking_id, current_user=current_user)
+
+
+@router.post("/payments", response_model=PaymentOut, status_code=status.HTTP_201_CREATED)
+def process_payment(
+    payload: PaymentRequest,
+    current_user: User = Depends(get_current_user),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    db: Session = Depends(get_db),
+):
+    payment_status = payload.force_status or (PaymentStatus.SUCCESS if secrets.randbelow(2) else PaymentStatus.FAILED)
+    if idempotency_key:
+        idempotency_key = idempotency_key.strip() or None
+        if idempotency_key and len(idempotency_key) > 100:
+            raise HTTPException(status_code=422, detail="Idempotency-Key must be at most 100 characters")
+    request_hash = None
+    if idempotency_key:
+        canonical = json.dumps(
+            {
+                "booking_id": payload.booking_id,
+                "force_status": payload.force_status.value if payload.force_status else None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request_hash = hashlib.sha256(canonical).hexdigest()
+    return process_mock_payment(
+        db,
+        booking_id=payload.booking_id,
+        user_id=current_user.id,
+        payment_status=PaymentStatus(payment_status),
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+    )
+
+
+@router.post("/payments/webhook", response_model=PaymentOut)
+async def payment_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    # Await the body first (requires async context), then dispatch DB work
+    # to the thread-pool so the sync SQLAlchemy calls don't block the event loop.
+    raw_body = await request.body()
+    verify_webhook_signature(raw_body, request.headers.get("X-Webhook-Signature"))
+    try:
+        payload_data = json.loads(raw_body)
+        payload = PaymentWebhook.model_validate(payload_data)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid webhook payload") from exc
+    return await run_in_threadpool(
+        process_webhook,
+        db,
+        event_id=payload.event_id,
+        payment_id=payload.payment_id,
+        booking_id=payload.booking_id,
+        status=payload.status,
+        amount=payload.amount,
+    )

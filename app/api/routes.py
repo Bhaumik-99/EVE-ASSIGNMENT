@@ -105,6 +105,21 @@ def update_centre(
     )
     if not centre:
         not_found("Diagnostic centre not found")
+    target_name = payload.name if payload.name is not None else centre.name
+    target_location = payload.location if payload.location is not None else centre.location
+    conflict = db.scalar(
+        select(DiagnosticCentre).where(
+            DiagnosticCentre.name == target_name,
+            DiagnosticCentre.location == target_location,
+            DiagnosticCentre.id != centre_id,
+        )
+    )
+    if conflict:
+        raise HTTPException(
+            status_code=409,
+            detail="A centre with this name already exists at this location",
+        )
+
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(centre, field, value)
     try:

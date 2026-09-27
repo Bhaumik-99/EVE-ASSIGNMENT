@@ -40,7 +40,7 @@ A production-grade FastAPI backend for diagnostic centre discovery, authenticate
 - **Role-Based Access Control (RBAC)**: Public patient self-registration; patients manage only their own bookings; `ADMIN` role can view and cancel any booking and manages the entire catalogue.
 - **Double-Booking Prevention**: Database-level composite unique constraint `(centre_id, test_id, appointment_at)` coupled with atomic transaction isolation.
 - **Stripe-Style Payment Idempotency**: Support for client `Idempotency-Key` headers paired with canonical request SHA-256 digests.
-- **Webhook Audit Event History & Replay Safety**: Dedicated `payment_events` table with unique provider `event_id` and HMAC-SHA256 request signature verification. Note: events are scoped to their parent payment lifecycle (CASCADE delete with payment).
+- **Payment Event / Audit History with Idempotency Protection**: Dedicated `payment_events` table with unique provider `event_id` and HMAC-SHA256 request signature verification. Note: event history is scoped to its parent payment lifecycle (cascading deletion with payment).
 - **Terminal State Protection**: Explicit state guards preventing regressions (e.g. `CONFIRMED` cannot regress to `FAILED`, and `CANCELLED` bookings cannot be resurrected).
 - **Redis Caching**: High-performance caching layer on diagnostic centre and test queries with automated TTL invalidation on administrative mutations.
 - **Celery & Background Jobs**: Asynchronous background workers powered by Celery & Redis for patient booking confirmation notifications and resilient webhook retries.
@@ -84,7 +84,7 @@ graph TB
 
     subgraph Services["Domain Service Layer"]
         BS["Booking Service<br/>• Slot Conflict Prevention<br/>• Price Snapshotting<br/>• Atomic Cancellation"]
-        PS["Payment Service<br/>• Idempotency-Key & Hash Matching<br/>• Ledger Event Recording<br/>• Terminal State Protection"]
+        PS["Payment Service<br/>• Idempotency-Key & Hash Matching<br/>• Audit Event Recording<br/>• Terminal State Protection"]
     end
 
     subgraph Storage["PostgreSQL 16 Database"]
@@ -481,7 +481,7 @@ erDiagram
     DIAGNOSTIC_CENTRES ||--o{ BOOKINGS : "hosts"
     DIAGNOSTIC_TESTS ||--o{ BOOKINGS : "scheduled_for"
     BOOKINGS ||--o| PAYMENTS : "has_single"
-    PAYMENTS ||--o{ PAYMENT_EVENTS : "records_ledger"
+    PAYMENTS ||--o{ PAYMENT_EVENTS : "records_events"
     BOOKINGS ||--o{ PAYMENT_EVENTS : "associated_with"
 
     USERS {
@@ -647,7 +647,7 @@ sequenceDiagram
     end
 
     rect rgb(255, 250, 245)
-    Note over Gateway,DB: Scenario 2: Asynchronous Webhook with Ledger Idempotency
+    Note over Gateway,DB: Scenario 2: Asynchronous Webhook with Audit History Idempotency
     Gateway->>API: POST /payments/webhook (Header: X-Webhook-Signature)
     API->>API: Verify HMAC-SHA256(raw_body, secret)
     alt Invalid Signature
@@ -661,7 +661,7 @@ sequenceDiagram
             PS-->>API: 409 Conflict (Payload tamper detected)
         end
         opt Fresh event_id
-            PS->>DB: Append to payment_events audit ledger
+            PS->>DB: Append to payment_events audit history
             PS->>DB: Lock and inspect Booking & Payment
             alt Booking is Terminal (CANCELLED or already CONFIRMED)
                 PS-->>API: 409 Conflict (Terminal state guard)

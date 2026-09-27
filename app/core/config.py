@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
     auth_rate_limit_per_minute: int = 30
     webhook_rate_limit_per_minute: int = 60
+    redis_url: str = "redis://localhost:6379/0"
+    celery_broker_url: str = "redis://localhost:6379/0"
+    celery_result_backend: str = "redis://localhost:6379/0"
+    cache_ttl_seconds: int = 300
 
     @model_validator(mode="after")
     def validate_security_settings(self):

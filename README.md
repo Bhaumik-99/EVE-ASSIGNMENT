@@ -42,6 +42,9 @@ A production-grade FastAPI backend for diagnostic centre discovery, authenticate
 - **Stripe-Style Payment Idempotency**: Support for client `Idempotency-Key` headers paired with canonical request SHA-256 digests.
 - **Webhook Ledger & Replay Safety**: Dedicated `payment_events` immutable ledger table with unique provider `event_id` and HMAC-SHA256 request signature verification.
 - **Terminal State Protection**: Explicit state guards preventing regressions (e.g. `CONFIRMED` cannot regress to `FAILED`, and `CANCELLED` bookings cannot be resurrected).
+- **Redis Caching**: High-performance caching layer on diagnostic centre and test queries with automated TTL invalidation on administrative mutations.
+- **Celery & Background Jobs**: Asynchronous background workers powered by Celery & Redis for patient booking confirmation notifications and resilient webhook retries.
+- **Webhook Retry Handling**: Resilient retry pipeline (`POST /api/v1/payments/webhook/retry`) executing with exponential backoff on transient failures.
 - **Observability & Resilience**: Structured JSON logging, `X-Request-ID` correlation tracking, in-memory rate limiting with `Retry-After` headers, and Kubernetes `/health` & `/ready` probes.
 
 ---

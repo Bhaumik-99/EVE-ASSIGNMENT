@@ -472,3 +472,91 @@ def test_unauthenticated_user_can_list_centres(client):
 def test_unauthenticated_user_cannot_list_bookings(client):
     assert client.get("/api/v1/bookings").status_code == 401
 
+
+# ---------------------------------------------------------------------------
+# Redis Caching & Cache Invalidation tests
+# ---------------------------------------------------------------------------
+
+def test_redis_caching_and_invalidation(client):
+    from app.core.cache import cache
+    admin = admin_auth(client)
+    cache.delete_pattern("centres:*")
+
+    # Create a centre
+    r = client.post("/api/v1/centres", headers=admin, json={"name": "Cache Centre", "location": "Noida"})
+    assert r.status_code == 201
+    centre_id = r.json()["id"]
+
+    # First fetch populates cache
+    first = client.get("/api/v1/centres?skip=0&limit=10")
+    assert first.status_code == 200
+
+    cached_val = cache.get("centres:list:0:10")
+    assert cached_val is not None
+    assert any(c["id"] == centre_id for c in cached_val)
+
+    # Update centre invalidates cache
+    patch = client.patch(f"/api/v1/centres/{centre_id}", headers=admin, json={"location": "Noida Sector 62"})
+    assert patch.status_code == 200
+    assert cache.get("centres:list:0:10") is None
+
+
+def test_centre_tests_caching(client):
+    from app.core.cache import cache
+    admin = admin_auth(client)
+    centre = client.post("/api/v1/centres", headers=admin, json={"name": "Test Cache Centre", "location": "Gurgaon"}).json()
+    test = client.post(f"/api/v1/centres/{centre['id']}/tests", headers=admin, json={"name": "X-Ray", "price": "300.00"}).json()
+
+    # List tests caches result
+    tests_res = client.get(f"/api/v1/centres/{centre['id']}/tests")
+    assert tests_res.status_code == 200
+    assert cache.get(f"centre:{centre['id']}:tests") is not None
+
+    # Patching test clears cache
+    client.patch(f"/api/v1/centres/{centre['id']}/tests/{test['id']}", headers=admin, json={"price": "350.00"})
+    assert cache.get(f"centre:{centre['id']}:tests") is None
+
+
+# ---------------------------------------------------------------------------
+# Background Task & Webhook Retry tests
+# ---------------------------------------------------------------------------
+
+def test_send_booking_confirmation_task(client):
+    from app.worker.tasks import send_booking_confirmation
+    headers = auth(client)
+    admin = admin_auth(client)
+    booking = make_booking(client, headers, admin_headers=admin, days=28)
+    
+    # Run task directly
+    res = send_booking_confirmation(booking["id"])
+    assert res.get("status") == "sent"
+    assert res.get("booking_id") == booking["id"]
+
+
+def test_webhook_retry_endpoint(client):
+    import hmac
+    import hashlib
+    headers = auth(client)
+    admin = admin_auth(client)
+    booking = make_booking(client, headers, admin_headers=admin, days=29)
+
+    payload = {
+        "event_id": "evt_retry_101",
+        "payment_id": "pay_retry_101",
+        "booking_id": booking["id"],
+        "status": "SUCCESS",
+        "amount": "500.00",
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    sig = hmac.new(b"test-webhook", body, hashlib.sha256).hexdigest()
+
+    response = client.post(
+        "/api/v1/payments/webhook/retry",
+        content=body,
+        headers={"Content-Type": "application/json", "X-Webhook-Signature": sig},
+    )
+    assert response.status_code == 202
+    assert response.json()["status"] == "accepted"
+
+
+

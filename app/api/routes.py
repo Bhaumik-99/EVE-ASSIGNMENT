@@ -36,6 +36,8 @@ from app.schemas import (
 from app.services.booking_service import cancel_booking as cancel_booking_service
 from app.services.booking_service import create_booking as create_booking_service
 from app.services.payment_service import process_mock_payment, process_webhook
+from app.core.cache import cache
+from app.worker.tasks import dispatch_task, send_booking_confirmation, process_webhook_retry
 
 router = APIRouter()
 
@@ -86,6 +88,7 @@ def create_centre(payload: CentreCreate, _: User = Depends(require_admin), db: S
         db.rollback()
         raise HTTPException(status_code=409, detail="A centre with this name already exists at this location") from exc
     db.refresh(centre)
+    cache.delete_pattern("centres:*")
     return centre
 
 
@@ -107,6 +110,8 @@ def update_centre(
         setattr(centre, field, value)
     db.commit()
     db.refresh(centre)
+    cache.delete_pattern("centres:*")
+    cache.delete(f"centre:{centre_id}")
     return centre
 
 
@@ -116,17 +121,29 @@ def list_centres(
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    return db.scalars(
+    cache_key = f"centres:list:{skip}:{limit}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return [CentreOut.model_validate(c) for c in cached]
+
+    centres = db.scalars(
         select(DiagnosticCentre)
         .options(selectinload(DiagnosticCentre.tests))
         .order_by(DiagnosticCentre.name)
         .offset(skip)
         .limit(limit)
     ).all()
+    cache.set(cache_key, [CentreOut.model_validate(c).model_dump(mode="json") for c in centres], ttl=120)
+    return centres
 
 
 @router.get("/centres/{centre_id}", response_model=CentreOut)
 def get_centre(centre_id: str, db: Session = Depends(get_db)):
+    cache_key = f"centre:{centre_id}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return CentreOut.model_validate(cached)
+
     centre = db.scalar(
         select(DiagnosticCentre)
         .options(selectinload(DiagnosticCentre.tests))
@@ -134,6 +151,7 @@ def get_centre(centre_id: str, db: Session = Depends(get_db)):
     )
     if not centre:
         not_found("Diagnostic centre not found")
+    cache.set(cache_key, CentreOut.model_validate(centre).model_dump(mode="json"), ttl=120)
     return centre
 
 
@@ -155,6 +173,8 @@ def create_test(
     db.add(test)
     db.commit()
     db.refresh(test)
+    cache.delete_pattern("centres:*")
+    cache.delete(f"centre:{centre_id}:tests")
     return test
 
 
@@ -178,6 +198,8 @@ def update_test(
         setattr(test, field, value)
     db.commit()
     db.refresh(test)
+    cache.delete_pattern("centres:*")
+    cache.delete(f"centre:{centre_id}:tests")
     return test
 
 
@@ -185,11 +207,18 @@ def update_test(
 def list_tests(centre_id: str, db: Session = Depends(get_db)):
     if not db.get(DiagnosticCentre, centre_id):
         not_found("Diagnostic centre not found")
-    return db.scalars(
+    cache_key = f"centre:{centre_id}:tests"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return [TestOut.model_validate(t) for t in cached]
+
+    tests = db.scalars(
         select(DiagnosticTest)
         .where(DiagnosticTest.centre_id == centre_id)
         .order_by(DiagnosticTest.name)
     ).all()
+    cache.set(cache_key, [TestOut.model_validate(t).model_dump(mode="json") for t in tests], ttl=120)
+    return tests
 
 
 @router.post("/bookings", response_model=BookingOut, status_code=status.HTTP_201_CREATED)
@@ -263,6 +292,9 @@ def process_payment(
         idempotency_key=idempotency_key,
         request_hash=request_hash,
     )
+    if payment.status == PaymentStatus.SUCCESS:
+        dispatch_task(send_booking_confirmation, str(payload.booking_id))
+    return payment
 
 
 @router.post("/payments/webhook", response_model=PaymentOut)
@@ -279,7 +311,7 @@ async def payment_webhook(
         payload = PaymentWebhook.model_validate(payload_data)
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="Invalid webhook payload") from exc
-    return await run_in_threadpool(
+    payment = await run_in_threadpool(
         process_webhook,
         db,
         event_id=payload.event_id,
@@ -288,3 +320,36 @@ async def payment_webhook(
         status=payload.status,
         amount=payload.amount,
     )
+    if payment.status == PaymentStatus.SUCCESS:
+        dispatch_task(send_booking_confirmation, str(payload.booking_id))
+    return payment
+
+
+@router.post("/payments/webhook/retry", status_code=status.HTTP_202_ACCEPTED)
+async def payment_webhook_retry(
+    request: Request,
+):
+    """Queues a webhook payload for resilient background execution with exponential backoff retries."""
+    raw_body = await request.body()
+    verify_webhook_signature(raw_body, request.headers.get("X-Webhook-Signature"))
+    try:
+        payload_data = json.loads(raw_body)
+        payload = PaymentWebhook.model_validate(payload_data)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid webhook payload") from exc
+
+    task_res = dispatch_task(
+        process_webhook_retry,
+        event_id=payload.event_id,
+        payment_id=payload.payment_id,
+        booking_id=payload.booking_id,
+        status=payload.status.value,
+        amount=str(payload.amount),
+    )
+    task_id = getattr(task_res, "id", "local-async")
+    return {
+        "status": "accepted",
+        "message": "Webhook queued for processing with retry handling",
+        "task_id": task_id,
+    }
+
